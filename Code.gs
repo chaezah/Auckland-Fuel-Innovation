@@ -199,3 +199,4 @@ function updateVesselArrivalBoard() {
     console.log("Error: " + e.message);
   }
 }
+
