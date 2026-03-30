@@ -97,45 +97,64 @@ function updateFuelData() {
   }
 }
 
-function scrapeFuelStocks_V3() {
+function scrapeFuelStocks_V18() {
   const url = "https://www.mbie.govt.nz/about/news/fuel-stocks-update";
   const html = UrlFetchApp.fetch(url).getContentText();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName("Stock_Log");
 
-  const dateMatch = html.match(/As at 11:59PM on (.*?),/);
-  const mbieDate = dateMatch ? dateMatch[1] : "Date Not Found";
-
-  // --- NEW: PHASE CAPTURE LOGIC ---
-  // This looks for "Phase 1", "Phase 2", etc. on the page.
-  const phaseMatch = html.match(/Phase\s*(\d)/i);
-  const currentPhase = phaseMatch ? "Phase " + phaseMatch[1] : "Phase 1";
-  // --------------------------------
-
-  const tables = html.split('<table');
-  const inCountryData = tables[1].split('<tr')[2].match(/[\d.]+/g); 
-  const onWaterData = tables[1].split('<tr')[3].match(/[\d.]+/g);
+  const currentSection = html.split(/Previous fuel stock/i)[0];
   
-  // Update signature to include the Phase (so if Phase changes, it triggers!)
-  const currentDataSignature = mbieDate + inCountryData.join("") + onWaterData.join("") + currentPhase;
+  const dateMatch = currentSection.match(/as at 11:59PM\s+([A-Za-z]+ \d{1,2} [A-Za-z]+)/i);
+  const mbieDate = dateMatch ? dateMatch[1] : "Date Pending";
 
-  const lastRow = sheet.getLastRow();
-  if (lastRow > 1) {
-    const lastSignature = sheet.getRange(lastRow, 9).getValue(); 
-    if (currentDataSignature === lastSignature) {
-      console.log("No change in data, date, or phase. Skipping.");
-      return; 
+  const phaseMatch = currentSection.match(/Phase\s*(\d)/i);
+  const currentPhase = phaseMatch ? "Phase " + phaseMatch[1] : "Phase 1";
+
+  function getCleanRowData(label) {
+    const rows = currentSection.split('<tr');
+    for (let r = 0; r < rows.length; r++) {
+      if (rows[r].toLowerCase().includes(label.toLowerCase())) {
+        const cells = rows[r].match(/<td[^>]*>(.*?)<\/td>/gi);
+        if (cells) {
+          return cells.map(cell => cell.replace(/<[^>]*>/g, '').trim());
+        }
+      }
     }
+    return null;
   }
 
-  const logDate = new Date();
+  const inCountry = getCleanRowData("In-country"); 
+  const withinEEZ = getCleanRowData("within EEZ"); 
+  const outsideEEZ = getCleanRowData("outside EEZ");
+
+  if (!inCountry) return console.log("Mapping failed.");
+
+  // Clean Signature
+  const signature = (mbieDate + inCountry[2] + withinEEZ[2]).replace(/\s/g, "");
+  const lastRow = sheet.getLastRow();
+  
   if (lastRow > 1) {
+    const lastSig = sheet.getRange(lastRow, 9).getValue();
+    if (signature === lastSig) return console.log("Data is already up to date.");
     sheet.getRange(2, 8, lastRow - 1, 1).setValue("Previous");
   }
 
-  // Column J (10th column) will now store the Phase
-  sheet.appendRow([logDate, mbieDate, "In-country", inCountryData[0], inCountryData[1], inCountryData[2], "", "Current", currentDataSignature, currentPhase]);
-  sheet.appendRow([logDate, mbieDate, "On-water", onWaterData[0], onWaterData[1], onWaterData[2], "Ships Here", "Current", currentDataSignature, currentPhase]);
+  const logDate = new Date();
+
+  // Helper to ensure numbers are numbers
+  const n = (val) => val ? Number(val.replace(/[^\d.]/g, '')) : 0;
+
+  // Final Mapping: [LogDate, MBIE Date, Category, Petrol, Diesel, Jet, Ships (Numeric), Status, Key, Phase]
+  // Row 1: In-country (Ships column gets a 0 or empty)
+  sheet.appendRow([logDate, mbieDate, "In-country", n(inCountry[2]), n(inCountry[3]), n(inCountry[4]), 0, "Current", signature, currentPhase]);
+  
+  // Row 2 & 3: Just n(value[1]) to get the clean number (5 or 10)
+  sheet.appendRow([logDate, mbieDate, "Within EEZ", n(withinEEZ[2]), n(withinEEZ[3]), n(withinEEZ[4]), n(withinEEZ[1]), "Current", signature, currentPhase]);
+  
+  sheet.appendRow([logDate, mbieDate, "Outside EEZ", n(outsideEEZ[2]), n(outsideEEZ[3]), n(outsideEEZ[4]), n(outsideEEZ[1]), "Current", signature, currentPhase]);
+  
+  console.log("Logged " + mbieDate + " with clean numeric ship counts.");
 }
 
 function updateVesselArrivalBoard() {
@@ -204,16 +223,18 @@ function scrapeGaspyComplete() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName("Gaspy_Data") || ss.insertSheet("Gaspy_Data");
   const captureTime = new Date();
+  
+  // CURRENT GOVT PHASE (Updated March 29, 2026)
+  const currentPhase = "Phase 1: Watchful";
 
-  // 1. Ensure Headers exist (Now with Column F for Status)
+  // 1. Ensure Headers exist (Column G is now Phase)
   if (sheet.getLastRow() === 0) {
-    sheet.appendRow(["Timestamp", "Region", "Fuel Type", "Price ($)", "Source", "Status"]);
-    sheet.getRange("A1:F1").setFontWeight("bold").setBackground("#cfe2f3");
+    sheet.appendRow(["Timestamp", "Region", "Fuel Type", "Price ($)", "Source", "Status", "Govt Phase"]);
+    sheet.getRange("A1:G1").setFontWeight("bold").setBackground("#cfe2f3");
   }
 
   try {
-    // 2. Archive Old Data
-    // Find all rows that currently say "Current" and change them to "History"
+    // 2. Archive Old Data (Flip "Current" to "History")
     const lastRow = sheet.getLastRow();
     if (lastRow > 1) {
       const statusRange = sheet.getRange(2, 6, lastRow - 1, 1);
@@ -221,21 +242,21 @@ function scrapeGaspyComplete() {
       statusRange.setValues(statuses);
     }
 
-    // 3. Define the New Data (Verified Feed + Baseline)
-    // We add "Current" to the end of every new row
+    // 3. Define the New Data Block
+    // Every row now includes the phase in Column G
     const newData = [
-      [captureTime, "NZ National", "91", "3.31", "Verified Market Feed", "Current"],
-      [captureTime, "NZ National", "95", "3.51", "Verified Market Feed", "Current"],
-      [captureTime, "NZ National", "Diesel", "3.13", "Verified Market Feed", "Current"],
-      [captureTime, "NZ Average", "91", "3.39", "Market Baseline", "Current"],
-      [captureTime, "NZ Average", "95", "3.59", "Market Baseline", "Current"],
-      [captureTime, "NZ Average", "Diesel", "3.21", "Market Baseline", "Current"]
+      [captureTime, "NZ National", "91", "3.31", "Verified Market Feed", "Current", currentPhase],
+      [captureTime, "NZ National", "95", "3.51", "Verified Market Feed", "Current", currentPhase],
+      [captureTime, "NZ National", "Diesel", "3.13", "Verified Market Feed", "Current", currentPhase],
+      [captureTime, "NZ Average", "91", "3.39", "Market Baseline", "Current", currentPhase],
+      [captureTime, "NZ Average", "95", "3.59", "Market Baseline", "Current", currentPhase],
+      [captureTime, "NZ Average", "Diesel", "3.21", "Market Baseline", "Current", currentPhase]
     ];
 
     // 4. Push to the sheet
-    sheet.getRange(sheet.getLastRow() + 1, 1, newData.length, 6).setValues(newData);
+    sheet.getRange(sheet.getLastRow() + 1, 1, newData.length, 7).setValues(newData);
 
-    console.log("Success! Data updated and status set to Current.");
+    console.log("Success! Data updated with Govt Phase: " + currentPhase);
 
   } catch (e) {
     console.log("Error: " + e.message);
